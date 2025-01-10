@@ -1,0 +1,82 @@
+{
+  "name": "ccc-deploy",
+  "description": "ccc-deploy is a minimalistic CLI tool for deploying stuffs on CKB with ccc.",
+  "version": "0.0.1-alpha",
+  "author": "Alive24",
+  "bin": {
+    "ccc-deploy": "./bin/run.js"
+  },
+  "bugs": "https://github.com/Alive24/ccc-deploy/issues",
+  "dependencies": {
+    "@ckb-ccc/shell": "^1.1.1",
+    "@iarna/toml": "^2.2.5",
+    "@inquirer/prompts": "^7.2.1",
+    "@oclif/core": "^4",
+    "@oclif/plugin-help": "^6",
+    "@oclif/plugin-plugins": "^5",
+    "chalk": "^5.4.1"
+  },
+  "devDependencies": {
+    "@oclif/prettier-config": "^0.2.1",
+    "@oclif/test": "^4",
+    "@types/chai": "^4",
+    "@types/mocha": "^10",
+    "@types/node": "^18",
+    "chai": "^4",
+    "dotenv": "^16.4.7",
+    "eslint": "^8",
+    "eslint-config-oclif": "^5",
+    "eslint-config-oclif-typescript": "^3",
+    "eslint-config-prettier": "^9",
+    "mocha": "^10",
+    "oclif": "^4",
+    "prettier": "^3.4.2",
+    "prettier-plugin-organize-imports": "^4.1.0",
+    "shx": "^0.3.3",
+    "ts-node": "^10",
+    "typescript": "^5",
+    "typescript-eslint": "^8.19.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "/bin",
+    "/dist",
+    "/oclif.manifest.json"
+  ],
+  "homepage": "https://github.com/Alive24/ccc-deploy/",
+  "keywords": [
+    "oclif"
+  ],
+  "license": "MIT",
+  "main": "dist/index.js",
+  "type": "module",
+  "oclif": {
+    "bin": "ccc-deploy",
+    "dirname": "ccc-deploy",
+    "commands": "./dist/commands",
+    "plugins": [
+      "@oclif/plugin-help",
+      "@oclif/plugin-plugins"
+    ],
+    "topicSeparator": " ",
+    "topics": {
+      "hello": {
+        "description": "Say hello to the world and others"
+      }
+    }
+  },
+  "repository": "pausable-udt/ccc-deploy",
+  "scripts": {
+    "build": "shx rm -rf dist && tsc -b",
+    "lint": "eslint . --ext .ts",
+    "postpack": "shx rm -f oclif.manifest.json",
+    "posttest": "pnpm run lint",
+    "prepack": "oclif manifest && oclif readme",
+    "test": "mocha --forbid-only \"test/**/*.test.ts\"",
+    "version": "oclif readme && git add README.md",
+    "dev": "node --loader ts-node/esm ./bin/dev.js"
+  },
+  "types": "dist/index.d.ts"
+}

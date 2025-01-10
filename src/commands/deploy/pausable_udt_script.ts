@@ -1,0 +1,531 @@
+import { ccc, mol } from "@ckb-ccc/shell";
+import * as TOML from "@iarna/toml";
+import { confirm, input, select } from "@inquirer/prompts";
+import { Args, Command, Flags } from "@oclif/core";
+import chalk from "chalk";
+import { execSync } from "child_process";
+import * as dotenv from "dotenv";
+import * as fs from "fs";
+import * as path from 'path';
+
+const PROJECT_PATHS = {
+  get root() {
+    // Only use debug path when in development mode and DEBUG_CONTRACT_PROJECT_ROOT is set
+    if (process.env.NODE_ENV === 'development' && process.env.DEBUG_CONTRACT_PROJECT_ROOT) {
+      this.log?.("Using debug project root:", process.env.DEBUG_CONTRACT_PROJECT_ROOT);
+      return process.env.DEBUG_CONTRACT_PROJECT_ROOT;
+    }
+    return process.cwd();
+  },
+  
+  get deployment() { return path.join(this.root, "deployment.toml") },
+  get config() { return path.join(this.root, "config.toml") },
+  get contractConfig() { return path.join(this.root, "contracts/pausable-udt/src/config.rs") },
+  get binary() { return path.join(this.root, "build/release/pausable-udt") },
+  log: null as ((message: string, ...args: any[]) => void) | null,
+};
+
+export default class PausableUDTScript extends Command {
+  static description = "Deploy a pausable UDT script interactively";
+
+  static args = {
+    configFile: Args.string({
+      description: "path to TOML file. Default to ./config.toml",
+      required: false,
+    }),
+  };
+
+  static flags = {
+    privateKey: Flags.string({
+      description:
+        "Use specific private key to sign. Will use MAIN_WALLET_PRIVATE_KEY from .env by default.",
+      required: false,
+    }),
+    network: Flags.string({
+      description: "Network to deploy to. Default to testnet.",
+      required: false,
+      options: ["testnet", "mainnet"],
+      default: "testnet",
+    }),
+    forceNew: Flags.boolean({
+      description: "Force new deployment even if config.toml already exists.",
+      required: false,
+      default: false,
+    }),
+  };
+
+  private generateRustConfig(configData: {
+    pauseList: string[];
+    nextTypeScript: ccc.Script | null;
+    name: string;
+    symbol: string;
+    decimals: number;
+  }): string {
+    return `#![no_std]
+
+// List of paused lock hashes
+pub const IN_CONTRACT_PAUSED_LOCK_HASHES: &[&str] = &[
+    ${(configData.pauseList || []).map((hash: string) => `"${hash}"`).join(",\n    ")}
+];
+
+pub const INITIAL_EXTERNAL_DATA_CELL_TYPE_CODE_HASH: &str = "${configData.nextTypeScript?.codeHash ?? ""}";
+pub const INITIAL_EXTERNAL_DATA_CELL_TYPE_ARGS: &str = "${configData.nextTypeScript?.args ?? ""}";
+
+
+pub const NAME: &str = "${configData.name}";
+pub const SYMBOL: &str = "${configData.symbol}";
+pub const DECIMALS: u8 = ${configData.decimals};
+`;
+  }
+
+  async run(): Promise<void> {
+    dotenv.config();
+    // Check .env file. If not there, create one from .env.example
+    if (!fs.existsSync('.env')) {
+      fs.copyFileSync('.env.example', '.env');
+      this.log(chalk.yellow("Created .env file from .env.example"));
+      this.error("Please fill in the .env file and run the command again.");
+    }
+    
+    const { args, flags } = await this.parse(PausableUDTScript);
+
+    // Add logger for debug info
+    PROJECT_PATHS.log = this.log.bind(this);
+
+    const network = flags.network ?? "testnet";
+    let client: ccc.Client;
+    if (network === "testnet") {
+      client = new ccc.ClientPublicTestnet({
+        url: process.env.CKB_RPC_URL,
+      });
+    } else if (network === "mainnet") {
+      client = new ccc.ClientPublicMainnet({
+        url: process.env.CKB_RPC_URL,
+      });
+    } else {
+      this.error("Invalid network");
+    }
+    const privateKey = flags.privateKey ?? process.env.WALLET_PRIVATE_KEY;
+    if (!privateKey) {
+      this.error("Private key is required");
+    }
+    const signer = new ccc.SignerCkbPrivateKey(
+      client,
+      privateKey,
+    );
+
+    const userAddress = await signer.getRecommendedAddress();
+    const userLockFromSigner = (await signer.getRecommendedAddressObj()).script;
+    let userLock: ccc.Script = userLockFromSigner;
+    const deploymentTomlContent = fs.readFileSync(
+      PROJECT_PATHS.deployment,
+      "utf8",
+    );
+    const parsedDeploymentTomlContent = TOML.parse(deploymentTomlContent) as {
+      cells: Array<{
+        name: string;
+        enable_type_id: boolean;
+        location: {
+          file: string;
+        };
+      }>;
+      lock?: {
+        code_hash: string;
+        args: string;
+        hash_type: string;
+      };
+    };
+
+    const udtPausableDataCodec = mol.table({
+      pause_list: mol.vector(mol.Byte32),
+      next_type_script: mol.option(ccc.Script),
+    });
+
+    if (!parsedDeploymentTomlContent.lock) {
+      const proceed = await confirm({
+        message:
+          `Lock not provided in deployment.toml. Should we use the current user lock from ${flags.privateKey ? "private key" : ".env"} as default?\n` +
+          `User Address: ${(await signer.getRecommendedAddressObj()).toString()}\n` +
+          `User lock: ${userLockFromSigner}\n`,
+      });
+      if (!proceed) {
+        this.error("Deployment cancelled.");
+      }
+    } else if (
+      userLockFromSigner.codeHash !==
+        (parsedDeploymentTomlContent.lock as Record<string, string>)[
+          "code_hash"
+        ] ||
+      userLockFromSigner.args !==
+        (parsedDeploymentTomlContent.lock as Record<string, string>)["args"] ||
+      userLockFromSigner.hashType !==
+        (parsedDeploymentTomlContent.lock as Record<string, string>)[
+          "hash_type"
+        ]
+    ) {
+      this.log(
+        chalk.yellow.bold(
+          `Found lock in deployment.toml but it's different from user lock from ${flags.privateKey ? "private key" : ".env"}:`,
+        ),
+      );
+      this.log(chalk.blue(`1. Lock from deployment.toml:`));
+      this.log(
+        chalk.yellow(
+          `{
+  code_hash: ${(parsedDeploymentTomlContent.lock as Record<string, string>)["code_hash"]}
+  args: ${(parsedDeploymentTomlContent.lock as Record<string, string>)["args"]},
+  hash_type: ${(parsedDeploymentTomlContent.lock as Record<string, string>)["hash_type"]}
+}`,
+        ),
+      );
+      this.log(chalk.blue(`2. User Lock from user address ${userAddress}: `));
+      this.log(
+        chalk.yellow(
+          `{
+  code_hash: ${userLockFromSigner.codeHash}
+  args: ${userLockFromSigner.args}
+  hash_type: ${userLockFromSigner.hashType}
+}`,
+        ),
+      );
+
+      type LockSource = "deployment" | "env";
+
+      const useLockFromDeploymentToml = await select({
+        message: "Which lock do you want to use?",
+        choices: [
+          {
+            name: "1. Lock from deployment.toml",
+            value: "deployment" as LockSource,
+            description: "Use the lock defined in deployment.toml",
+          },
+          {
+            name: `2. Lock from .env (From user address ${userAddress})`,
+            value: "env" as LockSource,
+            description: "Use the default user lock from .env",
+          },
+        ],
+      });
+
+      if (useLockFromDeploymentToml === "deployment") {
+        this.log("Using lock from deployment.toml as the user lock");
+        userLock = ccc.Script.from({
+          codeHash: parsedDeploymentTomlContent.lock.code_hash,
+          args: parsedDeploymentTomlContent.lock.args,
+          hashType: parsedDeploymentTomlContent.lock.hash_type,
+        });
+      } else {
+        this.log(
+          `Using user lock (from address ${userAddress}) from .env as the user lock`,
+        );
+      }
+    }
+    let inContractPauseListArray: string[] = [];
+    let firstExternalPausableDataCellType: ccc.Script | null = null;
+    let name: string;
+    let symbol: string;
+    let decimals: number;
+    // Check if there is initial-pausable_data.toml. If not, create one by asking for the pause list.
+    if (
+      !fs.existsSync(PROJECT_PATHS.config) || flags.forceNew
+    ) {
+      this.log(chalk.yellow(`${flags.forceNew ? "Forcing new config.toml" : "No config.toml found"}. Creating config.toml...`));
+      const pauseList = await input({
+        message:
+          "(Optional) Enter the list of paused lock hashes in HexString for the initial (i.e. in contract and can only be updated by upgrading the contract) pause list. Split with comma.",
+      });
+      inContractPauseListArray = pauseList
+        ? pauseList.split(",").map((hash: string) => hash.trim())
+        : [];
+      name = await input({
+        message: "Enter the name of the UDT",
+      });
+      symbol = await input({
+        message: "Enter the symbol of the UDT",
+      });
+      decimals = parseInt(
+        await input({
+          message: "Enter the decimals of the UDT",
+        }),
+      );
+      const confirmPauseList = await confirm({
+        message:
+          "Confirm the following pause list will be used for the initial (i.e. in contract and can only be updated by upgrading the contract) pause list:\n" +
+          inContractPauseListArray.join(", "),
+      });
+      if (!confirmPauseList) {
+        this.error("Deployment cancelled.");
+      }
+      const confirmUDTData = await confirm({
+        message:
+          "Confirm the following UDT data will be used:\n" +
+          `Name: ${name}\n` +
+          `Symbol: ${symbol}\n` +
+          `Decimals: ${decimals}`,
+      });
+      if (!confirmUDTData) {
+        this.error("Deployment cancelled.");
+      }
+      // Write the pause list to the config.toml file
+      fs.writeFileSync(
+        PROJECT_PATHS.config,
+        TOML.stringify({
+          in_contract_pause_list: inContractPauseListArray,
+          next_type_script: {
+            code_hash: "",
+            hash_type: "",
+            args: "",
+          },
+          udt_data: {
+            name,
+            symbol,
+            decimals,
+          },
+        }),
+      );
+    } else {
+      const configFileContent = fs.readFileSync(
+        args.configFile ??
+          PROJECT_PATHS.config,
+        "utf8",
+      );
+      const parsedConfigFileContent = TOML.parse(configFileContent) as {
+        in_contract_pause_list: string[];
+        next_type_script: {
+          code_hash: string;
+          hash_type: number;
+          args: string;
+        };
+        udt_data: {
+          name: string;
+          symbol: string;
+          decimals: number;
+        };
+      };
+      // Print and parsed config and confirm
+      this.log(chalk.green("Found config.toml! Parsed config file content: \n"), chalk.blue(parsedConfigFileContent));
+      const confirmConfig = await confirm({
+        message: "Confirm the config file is correct",
+      });
+      if (!confirmConfig) {
+        this.error("Deployment cancelled.");
+      }
+      inContractPauseListArray = parsedConfigFileContent.in_contract_pause_list;
+      name = parsedConfigFileContent.udt_data.name;
+      symbol = parsedConfigFileContent.udt_data.symbol;
+      decimals = parsedConfigFileContent.udt_data.decimals;
+      // Confirm the pause list
+      const confirmPauseList = await confirm({
+        message:
+          "Confirm the following pause list will be used for the initial (i.e. in contract and can only be updated by upgrading the contract) pause list:\n" +
+          inContractPauseListArray.join(", "),
+      });
+      if (!confirmPauseList) {
+        this.error("Deployment cancelled.");
+      }
+      if (
+        parsedConfigFileContent.next_type_script.code_hash !== "" ||
+        parsedConfigFileContent.next_type_script.args !== ""
+      ) {
+        const confirmNextTypeScript = await confirm({
+          message:
+            "Confirm the following next type script will be used:\n" +
+            `Code Hash: ${parsedConfigFileContent.next_type_script.code_hash}\n` +
+            `Hash Type: ${parsedConfigFileContent.next_type_script.hash_type}\n` +
+            `Args: ${parsedConfigFileContent.next_type_script.args}`,
+        });
+        if (!confirmNextTypeScript) {
+          this.error("Deployment cancelled.");
+        }
+        firstExternalPausableDataCellType = ccc.Script.from({
+          codeHash: parsedConfigFileContent.next_type_script.code_hash,
+          hashType: parsedConfigFileContent.next_type_script.hash_type,
+          args: parsedConfigFileContent.next_type_script.args,
+        });
+      }
+      const confirmUDTData = await confirm({
+        message:
+          "Confirm the following UDT data will be used:\n" +
+          `Name: ${name}\n` +
+          `Symbol: ${symbol}\n` +
+          `Decimals: ${decimals}`,
+      });
+      if (!confirmUDTData) {
+        this.error("Deployment cancelled.");
+      }
+    }
+
+    // Prompt if want to create the first external pausable data cell
+    let externalPauseListArray: string[] = [];
+    if (firstExternalPausableDataCellType === null) {
+      const createFirstExternalPausableDataCell = await confirm({
+        message:
+          "(Optional) Do you want to create the first external pausable data cell and point to it in the script config?",
+      });
+      if (createFirstExternalPausableDataCell) {
+        const firstExternalPausableDataCell = await input({
+          message:
+            "(Optional) Enter the paused lock hashes of the first external pausable data cell (i.e. external and can be updated without upgrading the contract) in HexString. Split with comma.",
+        });
+        externalPauseListArray = firstExternalPausableDataCell
+          .split(",")
+          .map((hash: string) => hash.trim());
+        const firstExternalPausableData = udtPausableDataCodec.encode({
+          pause_list: externalPauseListArray,
+          next_type_script: null,
+        });
+        const typeIdTx = ccc.Transaction.from({
+          outputs: [
+            {
+              lock: userLock,
+              type: await ccc.Script.fromKnownScript(
+                signer.client,
+                ccc.KnownScript.TypeId,
+                "00".repeat(32),
+              ),
+            },
+          ],
+          outputsData: [firstExternalPausableData],
+        });
+        await typeIdTx.completeInputsByCapacity(signer);
+        if (!typeIdTx.outputs[0].type) {
+          this.error("Unexpected disappeared output");
+        }
+
+        typeIdTx.outputs[0].type.args = ccc.hashTypeId(typeIdTx.inputs[0], 0);
+        await typeIdTx.completeFeeBy(signer);
+        this.log("Transaction sent:", await signer.sendTransaction(typeIdTx));
+        this.log(chalk.green("First external pausable data cell created with Type ID Args: "), typeIdTx.outputs[0].type.args);
+        this.log(chalk.green("Type ID of the first external pausable data cell: "), typeIdTx.outputs[0].type.hash());
+        firstExternalPausableDataCellType = typeIdTx.outputs[0].type;
+        // Write the pause list to the config.toml file
+        fs.writeFileSync(
+          PROJECT_PATHS.config,
+          TOML.stringify({
+            in_contract_pause_list: inContractPauseListArray,
+            next_type_script: {
+              code_hash: firstExternalPausableDataCellType.codeHash,
+              hash_type: firstExternalPausableDataCellType.hashType,
+              args: firstExternalPausableDataCellType.args,
+            },
+            udt_data: {
+              name,
+              symbol,
+              decimals,
+            },
+          }),
+        );
+      }
+    }
+
+    let scriptConfigData: {
+      pauseList: string[];
+      nextTypeScript: ccc.Script | null;
+      name: string;
+      symbol: string;
+      decimals: number;
+    } = {
+      pauseList: inContractPauseListArray,
+      nextTypeScript: firstExternalPausableDataCellType,
+      name,
+      symbol,
+      decimals,
+    };
+
+    const pausableUDTConfigFileContent =
+      this.generateRustConfig(scriptConfigData);
+
+    // Parse existing config.rs file if it exists
+    let shouldWrite = true;
+    const configPath =
+      PROJECT_PATHS.contractConfig;
+    if (fs.existsSync(configPath)) {
+      const existingConfig = fs.readFileSync(configPath, "utf8");
+      const hasExistingPauseList =
+        existingConfig.includes("IN_CONTRACT_PAUSED_LOCK_HASHES") &&
+        !existingConfig.match(
+          /IN_CONTRACT_PAUSED_LOCK_HASHES: &\[&str\] = &\[\s*\]/,
+        );
+      const hasExistingTypeScript =
+        existingConfig.includes("INITIAL_EXTERNAL_DATA_CELL_TYPE_CODE_HASH") &&
+        existingConfig.match(
+          /INITIAL_EXTERNAL_DATA_CELL_TYPE_CODE_HASH: &str = ".*[^"]"/,
+        );
+
+      const hasExistingName =
+        existingConfig.includes("NAME") &&
+        existingConfig.match(/NAME: &str = ".*[^"]"/);
+      const hasExistingSymbol =
+        existingConfig.includes("SYMBOL") &&
+        existingConfig.match(/SYMBOL: &str = ".*[^"]"/);
+
+      if (
+        hasExistingPauseList ||
+        hasExistingTypeScript ||
+        hasExistingName ||
+        hasExistingSymbol
+      ) {
+        const proceed = await confirm({
+          message:
+            "Existing config.rs contains pause list or type script data. Overwrite?",
+        });
+        shouldWrite = proceed;
+        if (!proceed) {
+          this.log("Keeping existing config.rs file");
+        }
+      }
+    }
+
+    if (shouldWrite) {
+      fs.writeFileSync(configPath, pausableUDTConfigFileContent);
+    }
+
+    // Print the config.rs file and confirm
+    this.log(chalk.yellow("Config.rs file:"));
+    this.log(chalk.cyan(pausableUDTConfigFileContent));
+    const confirmConfig = await confirm({
+      message: "Confirm the config.rs file is correct?",
+    });
+    if (!confirmConfig) {
+      this.error("Deployment cancelled.");
+    }
+    this.log(chalk.yellow("Building contracts..."));
+    try {
+      execSync("make build", { 
+        stdio: 'inherit',
+        cwd: PROJECT_PATHS.root // Adjust this path as needed
+      });
+    } catch (error) {
+      this.error("Build failed: " + error);
+    }
+
+    this.log(chalk.green("Contract built successfully!"));
+
+    this.log(chalk.yellow("Deploying contracts..."));
+    const contractBinary = fs.readFileSync(
+      PROJECT_PATHS.binary,
+    );
+    const deployTx = ccc.Transaction.from({
+      outputs: [
+        {
+          lock: userLock,
+          type: await ccc.Script.fromKnownScript(signer.client, ccc.KnownScript.TypeId, "00".repeat(32)),
+        },
+      ],
+      outputsData: [
+        contractBinary,
+      ],
+    });
+    await deployTx.completeInputsByCapacity(signer);
+    if (!deployTx.outputs[0].type) {
+      this.error("Unexpected disappeared output");
+    }
+    deployTx.outputs[0].type.args = ccc.hashTypeId(deployTx.inputs[0], 0);
+    await deployTx.completeFeeBy(signer);
+    this.log("Transaction sent:", await signer.sendTransaction(deployTx));
+    this.log(chalk.green("Contract deployed successfully!"));
+    this.log(chalk.green("Type ID Args: "), deployTx.outputs[0].type.args);
+    this.log(chalk.green("Type ID of the contract: "), deployTx.outputs[0].type.hash());
+    this.exit(0);
+  }
+}
