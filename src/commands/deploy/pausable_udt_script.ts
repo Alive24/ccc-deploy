@@ -40,7 +40,8 @@ const PROJECT_PATHS = {
 };
 
 export default class PausableUDTScript extends Command {
-  static description = "Deploy a pausable UDT script interactively";
+  static description =
+    "Deploy a pausable UDT script interactively. Should be run at a cloned repository of [pausable-udt](https://github.com/ckb-devrel/pausable-udt)";
 
   static args = {
     configFile: Args.string({

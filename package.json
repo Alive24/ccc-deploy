@@ -1,7 +1,7 @@
 {
   "name": "ccc-deploy",
   "description": "ccc-deploy is a minimalistic CLI tool for deploying stuffs on CKB with ccc.",
-  "version": "0.0.1-alpha",
+  "version": "0.0.1-0",
   "author": "Alive24",
   "bin": {
     "ccc-deploy": "./bin/run.js"
@@ -62,8 +62,8 @@
     ],
     "topicSeparator": " ",
     "topics": {
-      "hello": {
-        "description": "Say hello to the world and others"
+      "deploy": {
+        "description": "Deploy a script or special cell on CKB"
       }
     }
   },
