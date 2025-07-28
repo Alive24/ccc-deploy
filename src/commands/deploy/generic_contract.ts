@@ -281,6 +281,27 @@ export default class GenericContract extends Command {
         }
       }
 
+      // Check data hash for upgrades
+      if (existingDeployment && useTypeId && !flags.type) {
+        const newDataHash = ccc.hashCkb(contractBinary);
+        
+        if (newDataHash === existingDeployment.dataHash) {
+          this.log(chalk.yellow("\n⚠️  Warning: Contract binary is identical to existing deployment"));
+          this.log(chalk.gray(`  Existing data hash: ${existingDeployment.dataHash}`));
+          this.log(chalk.gray(`  New data hash:      ${newDataHash}`));
+          
+          const confirmIdentical = await confirm({
+            message: 'The contract binary has not changed. Do you still want to proceed with the upgrade?',
+            default: false
+          });
+          
+          if (!confirmIdentical) {
+            this.log(chalk.red("Upgrade cancelled"));
+            return;
+          }
+        }
+      }
+
       this.log(chalk.blue(`\n${existingDeployment ? 'Upgrading' : 'Deploying'} contract (${contractBinary.length} bytes)...`));
 
       if (useTypeId && !flags.type) {
