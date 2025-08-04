@@ -5,6 +5,7 @@ import chalk from "chalk";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
+import { execSync } from "child_process";
 
 /**
  * Deploy Generic Contract Command
@@ -264,7 +265,7 @@ export default class GenericContract extends Command {
     }
 
     // Read contract binary
-    const contractBinary = fs.readFileSync(args.contractPath);
+    let contractBinary = fs.readFileSync(args.contractPath);
 
     try {
       let deployTx: ccc.Transaction;
@@ -290,15 +291,94 @@ export default class GenericContract extends Command {
           this.log(chalk.gray(`  Existing data hash: ${existingDeployment.dataHash}`));
           this.log(chalk.gray(`  New data hash:      ${newDataHash}`));
           
-          const confirmIdentical = await confirm({
-            message: 'The contract binary has not changed. Do you still want to proceed with the upgrade?',
-            default: false
+          // Suggest rebuilding the contract
+          this.log(chalk.yellow("\n💡 Tip: The contract may not have been rebuilt since last deployment."));
+          this.log(chalk.yellow("   Consider running 'make build' in your contracts directory first."));
+          
+          const rebuildChoice = await select({
+            message: 'What would you like to do?',
+            choices: [
+              {
+                name: 'Rebuild the contract now',
+                value: 'rebuild',
+                description: 'Run make build and retry deployment (recommended)'
+              },
+              {
+                name: 'Proceed with upgrade anyway',
+                value: 'proceed',
+                description: 'Use this for testing or configuration changes'
+              },
+              {
+                name: 'Cancel upgrade',
+                value: 'cancel',
+                description: 'Exit without making changes'
+              }
+            ]
           });
           
-          if (!confirmIdentical) {
+          if (rebuildChoice === 'rebuild') {
+            this.log(chalk.blue("\n🔨 Rebuilding contracts..."));
+            
+            // Check if we're in a contracts directory or need to navigate to it
+            const currentDir = process.cwd();
+            const contractsDir = fs.existsSync(path.join(currentDir, 'contracts')) 
+              ? path.join(currentDir, 'contracts')
+              : currentDir.endsWith('contracts') 
+                ? currentDir 
+                : null;
+            
+            if (!contractsDir) {
+              this.log(chalk.red("Could not find contracts directory"));
+              this.log(chalk.yellow("Please navigate to your project root or contracts directory and try again"));
+              return;
+            }
+            
+            try {
+              // Run make build
+              execSync('make build', { 
+                cwd: contractsDir,
+                stdio: 'inherit' 
+              });
+              
+              this.log(chalk.green("\n✅ Contracts rebuilt successfully!"));
+              this.log(chalk.blue("Continuing with deployment...\n"));
+              
+              // Re-read the contract binary after rebuild
+              const rebuiltBinary = fs.readFileSync(args.contractPath);
+              const rebuiltDataHash = ccc.hashCkb(rebuiltBinary);
+              
+              // Check if the hash changed after rebuild
+              if (rebuiltDataHash === existingDeployment.dataHash) {
+                this.log(chalk.yellow("⚠️  Warning: Contract binary is still identical after rebuild"));
+                this.log(chalk.gray("   This might mean no source code changes were made"));
+                
+                const continueAnyway = await confirm({
+                  message: 'Continue with upgrade anyway?',
+                  default: false
+                });
+                
+                if (!continueAnyway) {
+                  this.log(chalk.red("Upgrade cancelled"));
+                  return;
+                }
+              } else {
+                this.log(chalk.green("✅ Contract binary updated successfully"));
+                this.log(chalk.gray(`  Old data hash: ${existingDeployment.dataHash}`));
+                this.log(chalk.gray(`  New data hash: ${rebuiltDataHash}`));
+                
+                // Update the contractBinary variable to use the rebuilt version
+                contractBinary = rebuiltBinary;
+              }
+            } catch (error) {
+              this.log(chalk.red(`\n❌ Build failed: ${error}`));
+              this.log(chalk.yellow("Please fix the build errors and try again"));
+              return;
+            }
+          } else if (rebuildChoice === 'cancel') {
             this.log(chalk.red("Upgrade cancelled"));
             return;
           }
+          // If 'proceed', continue with the upgrade
         }
       }
 
@@ -764,10 +844,22 @@ export default class GenericContract extends Command {
         });
       }
     } else {
-      // Non-semantic versioning, just ask for input
+      // Non-semantic versioning, check if it's a timestamp-based tag
+      let defaultNewTag: string;
+      
+      // Check if current tag is timestamp-based (vYYYYMMDD-HHMM format)
+      const timestampMatch = fromDeployment.tag.match(/^v(\d{8})-(\d{4})$/);
+      if (timestampMatch) {
+        // Generate a new timestamp-based tag
+        defaultNewTag = this.generateDeploymentTag();
+      } else {
+        // For other formats, just append -new
+        defaultNewTag = `${fromDeployment.tag}-new`;
+      }
+      
       newTag = await input({
         message: 'Enter tag for the new version:',
-        default: `${fromDeployment.tag}-new`,
+        default: defaultNewTag,
         validate: (value) => {
           if (!value.trim()) {
             return 'Tag cannot be empty';
